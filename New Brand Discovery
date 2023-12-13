@@ -1,0 +1,175 @@
+-- step 1 Pool products 
+
+create or replace table tokopedia-970.sandbox_merchant.pool_product_brand_discovery as 
+select   product_id, child_cat_id_by_order, product_name, brand, brand_source,brand_series,
+  count(distinct order_id) orders, 
+  sum(quantity) qty_sold, 
+  sum(subtotal_price) tiv,
+from tokopedia-970.sandbox_merchant.ft_market_share_brand 
+where date_key between "2023-08-01" and "2023-10-31"
+group by 1,2,3,4,5,6
+
+
+-- step 2 Stop words cleaned
+
+-- create or replace table tokopedia-970.sandbox_merchant.dm_brand_stop_words_cleaned2
+-- as 
+select *, trim(regexp_replace(regexp_replace(regexp_replace(lower(stop_word_cleaned), r"[^a-zA-Z0-9 ]+", " "), r"[ ]+", " ") , r"([0-9]+)", "")) stop_word_cleaned_filter
+from (select *
+from tokopedia-970.sandbox_merchant.dm_brand_stop_words, unnest(split(stop_word, ' ')) stop_word_cleaned  ) 
+
+
+-- step 3 ML-Ngrams Extraction
+
+-- create or replace table `tokopedia-970.sandbox_merchant.product_brand_discovery_unbrand_only` as
+
+with
+pool_products as (
+select distinct
+  product_id,
+  child_cat_id_by_order,
+  product_name, 
+  orders, 
+  qty_sold, 
+  tiv,
+  regexp_replace(regexp_replace(lower(product_name), r"[^a-zA-Z0-9 ]+", " "), r"[ ]+", " ") product_name_cleaned
+from `tokopedia-970.sandbox_merchant.pool_product_brand_discovery`
+where brand = "Unmapped"
+-- where is_DA_brand_available is false 
+-- and is_DS_brand_available is false
+)
+
+,pool_product_testing as 
+(select 1 product_id,
+  1 child_cat_id_by_order,
+  "emas" product_name, 
+  1 orders, 
+  1 qty_sold, 
+  1 tiv,
+  regexp_replace(regexp_replace(lower("emas"), r"[^a-zA-Z0-9 ]+", " "), r"[ ]+", " ") product_name_cleaned 
+)
+
+,n_grams as (
+select distinct
+  product_id,
+  child_cat_id_by_order,
+  product_name,
+  orders, 
+  qty_sold, 
+  tiv,
+  regexp_replace(one_word_ngram, r"[ ]+", "") product_name_cleaned
+from pool_products,
+-- from pool_product_testing,
+unnest(ML.NGRAMS(split(regexp_replace(product_name_cleaned, r'(\pP)', r' \1 '), ' '), [1], ' ')) as one_word_ngram
+where regexp_contains(one_word_ngram, r"[a-zA-Z]+") and regexp_replace(one_word_ngram, r"[ ]+", "") <> ""
+),
+
+potential_brand as (
+select n_grams.*
+from n_grams
+left join (
+  select distinct stop_word_cleaned_filter product_name_cleaned
+  from `tokopedia-970.sandbox_merchant.dm_brand_stop_words_cleaned2`
+  ) exc using(product_name_cleaned)
+where exc.product_name_cleaned is null
+),
+
+summary as (
+select 
+  child_cat_id_by_order,
+  product_name_cleaned potential_brand_name,
+  count(distinct concat(product_id, product_name)) unique_products,
+  sum(orders) orders,
+  sum(qty_sold) qty_sold,
+  sum(tiv) tiv
+from potential_brand
+group by 1,2
+having unique_products >= 10 -- Brand sebagai suatu nama merek harusnya punya multiple products, ini sbg threshold
+and REGEXP_CONTAINS(product_name_cleaned, r"([0-9])") is false
+),
+
+sample_product_name as (
+select distinct
+  child_cat_id_by_order,
+  product_name_cleaned potential_brand_name,
+  product_id, 
+  product_name,
+  orders orders_product,
+  row_number() over(partition by child_cat_id_by_order, product_name_cleaned order by orders desc, tiv desc, qty_sold desc, product_id asc) rn
+from potential_brand
+qualify rn <= 3
+)
+
+,current_brand as 
+(select brand
+from tokopedia-970.sandbox_merchant.pool_product_brand_discovery
+group by 1 
+
+union distinct 
+
+select brand_series brand 
+from tokopedia-970.sandbox_merchant.pool_product_brand_discovery
+group by 1
+
+)
+
+select 
+  summary.*,case when brand is not null then 1 else 0 end already_input , 
+  level0_cat_name, level1_cat_name, level2_cat_name, level3_cat_name,
+  string_agg(concat(rn, '. [', product_id, '-', orders_product,  'orders] ', product_name), ' \n' order by rn) sample_products
+from summary
+left join sample_product_name spn using(child_cat_id_by_order, potential_brand_name)
+left join (select * except(child_cat_id), child_cat_id as child_cat_id_by_order from tokopedia-970.zoom.dt_product_category where current_ind = 1) using(child_cat_id_by_order)
+left join current_brand on brand = potential_brand_name
+group by 1,2,3,4,5,6,7,8,9,10,11
+order by child_cat_id_by_order, unique_products desc
+
+-- select *
+-- from potential_brand
+
+
+
+-- step 4 Lavvenstein Disctance 
+
+-- create or replace table tokopedia-970.sandbox_merchant.product_brand_discovery_similarity as 
+
+with brand_disc as 
+(select distinct potential_brand_name
+from`tokopedia-970.sandbox_merchant.product_brand_discovery_unbrand_only`
+-- where potential_brand_name = "berkomunikasi"
+-- limit 50000
+)
+
+,stop_word_filter as 
+(select distinct stop_word_cleaned_filter stop_word_cleaned
+           from tokopedia-970.sandbox_merchant.dm_brand_stop_words_cleaned2
+  where length(stop_word_cleaned) >= 5
+)
+
+-- SELECT fhoffa.x.levenshtein('felipe', 'hoffa')
+--  , fhoffa.x.levenshtein('googgle', 'goggles')
+--  , fhoffa.x.levenshtein('is this the', 'Is This The')
+select potential_brand_name, stop_word_cleaned, 
+length(potential_brand_name) as len_potential_brand_name,
+length(stop_word_cleaned) as len_stop_word_cleaned,
+-- fhoffa.x.levenshtein(stop_word_cleaned, potential_brand_name)
+from brand_disc 
+,stop_word_filter
+-- where lower(potential_brand_name) like concat("%",lower(stop_word_cleaned),"%")
+where length(potential_brand_name) >= length(stop_word_cleaned)-1
+  
+
+
+-- step 5 Lavvenstein Disctance Score
+
+
+-- create or replace table tokopedia-970.sandbox_merchant.product_brand_discovery_similarity_score as 
+
+with similarity as 
+(SELECT *, fhoffa.x.levenshtein(stop_word_cleaned, potential_brand_name) similarity_len
+FROM `tokopedia-970.sandbox_merchant.product_brand_discovery_similarity` )
+
+select *, nullif((len_potential_brand_name-similarity_len),0)/nullif(len_potential_brand_name,0) as similarity_score
+from similarity
+where len_stop_word_cleaned > 1
+and nullif((len_potential_brand_name-similarity_len),0)/nullif(len_potential_brand_name,0) > 0.3
